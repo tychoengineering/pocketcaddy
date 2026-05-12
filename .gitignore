@@ -1,0 +1,5 @@
+caddy-test
+data/
+buildenv_*/
+*.sqlite-shm
+*.sqlite-wal

@@ -1,0 +1,15 @@
+{
+	admin off
+	auto_https off
+}
+
+:8899 {
+	handle_path /api/* {
+		pocketcaddy {
+			root data
+			sql_dir data/sql
+			max_rows 100000
+			timeout 30
+		}
+	}
+}

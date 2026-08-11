@@ -17,7 +17,46 @@ comment directives, and each one becomes an HTTP endpoint that streams JSONL.
   identifier against the query's output columns, then quotes it.
 - **Pure Go.** Uses `modernc.org/sqlite`, so `xcaddy` builds need no cgo.
 
+## Installing
+
+The `pocketcaddy` binary is Caddy with this handler compiled in, so it takes
+every Caddy command and Caddyfile directive. Releases cover macOS arm64 and
+Linux amd64.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tychoengineering/pocketcaddy/main/install.sh | sh
+```
+
+The script picks the right build, checks it against the release checksums, and
+installs to `/usr/local/bin`. Set `INSTALL_DIR` to put it elsewhere and
+`POCKETCADDY_VERSION` to pin a release.
+
+With Homebrew:
+
+```sh
+brew install tychoengineering/tap/pocketcaddy
+```
+
+With Go, which builds from source and works on any platform:
+
+```sh
+go install github.com/tychoengineering/pocketcaddy/cmd/pocketcaddy@latest
+```
+
+Then run a Caddyfile:
+
+```sh
+pocketcaddy run --config Caddyfile
+```
+
+The macOS binary is unsigned. Both the install script and Homebrew clear the
+quarantine attribute, but an archive downloaded through a browser will not
+open until you clear it yourself with
+`xattr -dr com.apple.quarantine pocketcaddy`.
+
 ## Building
+
+To add this handler to an existing Caddy build instead:
 
 ```sh
 xcaddy build --with github.com/tychoengineering/pocketcaddy

@@ -1,0 +1,97 @@
+version: 2
+
+project_name: pocketcaddy
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: pocketcaddy
+    main: ./cmd/pocketcaddy
+    binary: pocketcaddy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # Ship only the two targets we support: macOS arm64 and Linux amd64.
+      - goos: darwin
+        goarch: amd64
+      - goos: linux
+        goarch: arm64
+    flags:
+      - -trimpath
+    ldflags:
+      # -s -w strips the symbol table and DWARF, which halves the binary.
+      # The CustomVersion stamp makes `pocketcaddy version` report the
+      # release tag rather than the embedded Caddy version. The value must
+      # hold no spaces: the linker splits -X on whitespace.
+      - -s -w
+      - -X github.com/caddyserver/caddy/v2.CustomVersion=pocketcaddy/v{{ .Version }}
+
+archives:
+  - id: pocketcaddy
+    formats: [tar.gz]
+    # pocketcaddy_0.1.0_darwin_arm64.tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+homebrew_casks:
+  - name: pocketcaddy
+    repository:
+      owner: tychoengineering
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: "https://github.com/tychoengineering/pocketcaddy"
+    description: "A Caddy server that serves named, read-only SQL queries over SQLite as JSONL"
+    hooks:
+      post:
+        # The binary is unsigned, so Gatekeeper would otherwise refuse to
+        # run it. Stripping the quarantine attribute on install avoids the
+        # "unidentified developer" prompt.
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr",
+                           args: ["-dr", "com.apple.quarantine", "#{staged_path}/pocketcaddy"]
+          end
+
+release:
+  github:
+    owner: tychoengineering
+    name: pocketcaddy
+  draft: false
+  prerelease: auto
+  header: |
+    ## Install
+
+    ```sh
+    curl -fsSL https://raw.githubusercontent.com/tychoengineering/pocketcaddy/main/install.sh | sh
+    ```
+
+    Or with Homebrew:
+
+    ```sh
+    brew install tychoengineering/tap/pocketcaddy
+    ```

@@ -3,3 +3,6 @@ data/
 buildenv_*/
 *.sqlite-shm
 *.sqlite-wal
+dist/
+.env
+.env.*

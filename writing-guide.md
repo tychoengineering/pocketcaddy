@@ -1,4 +1,4 @@
-# Asif’s Technical Writing Guide
+# Technical Writing Guide
 
 ## Principles of Plain Language
 

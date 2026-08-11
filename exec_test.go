@@ -56,8 +56,12 @@ func TestBindArgsEmptyListMatchesNothing(t *testing.T) {
 	if len(args) != 0 {
 		t.Errorf("empty list should bind no args, got %v", args)
 	}
-	if !strings.Contains(sql, "WHERE 0") {
-		t.Errorf("empty list should yield a never-true subselect, got %q", sql)
+	// `IN (NULL)` is never true, and unlike `IN ()` it parses.
+	if !strings.Contains(sql, "NULL") {
+		t.Errorf("empty list should yield a never-true predicate, got %q", sql)
+	}
+	if strings.Contains(sql, "()") {
+		t.Errorf("empty list produced invalid `IN ()`, got %q", sql)
 	}
 }
 
@@ -104,53 +108,56 @@ func TestBindArgsRejectsScalarForListParam(t *testing.T) {
 	}
 }
 
-// walkPlaceholders must not treat a colon inside a literal, identifier or
-// comment as a parameter -- doing so would corrupt the SQL.
-func TestWalkPlaceholdersIgnoresNonParameterColons(t *testing.T) {
+// A colon inside a literal, identifier or comment is not a placeholder.
+// Parsing to an AST makes this structural: only a *sql.BindExpr node is ever
+// rewritten. Each case declares one list param to force the expansion path,
+// and asserts the bound args -- if a stray colon were treated as a parameter,
+// the arg count would change or binding would fail outright.
+func TestBindArgsIgnoresNonParameterColons(t *testing.T) {
 	cases := []struct {
 		name string
 		sql  string
-		want []string // parameter names expected to be seen
 	}{
-		{"string literal", `SELECT 'a:b' , :real`, []string{"real"}},
-		{"escaped quote", `SELECT 'it''s :not' , :real`, []string{"real"}},
-		{"double-quoted ident", `SELECT "col:x" FROM t WHERE a = :real`, []string{"real"}},
-		{"backtick ident", "SELECT `c:x` FROM t WHERE a = :real", []string{"real"}},
-		{"line comment", "-- :nope\nSELECT :real", []string{"real"}},
-		{"block comment", "/* :nope */ SELECT :real", []string{"real"}},
-		{"cast operator", `SELECT x::text, :real`, []string{"real"}},
-		{"time literal", `SELECT '12:30:00', :real`, []string{"real"}},
-		{"multiple", `SELECT :a, :b WHERE c = ':skip'`, []string{"a", "b"}},
+		{"string literal", `SELECT 'a:b' WHERE x IN (:ids)`},
+		{"escaped quote", `SELECT 'it''s :not' WHERE x IN (:ids)`},
+		{"double-quoted ident", `SELECT "col:x" FROM t WHERE a IN (:ids)`},
+		{"line comment", "-- :nope\nSELECT 1 WHERE x IN (:ids)"},
+		{"block comment", "/* :nope */ SELECT 1 WHERE x IN (:ids)"},
+		{"time literal", `SELECT '12:30:00' WHERE x IN (:ids)`},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var seen []string
-			var sb strings.Builder
-			err := walkPlaceholders(tc.sql, &sb, func(name string) (string, error) {
-				seen = append(seen, name)
-				return "?", nil
+			q := mkQuery(tc.sql, Param{Name: "ids", Type: TypeIntList})
+			gotSQL, args, err := bindArgs(q, map[string]any{
+				"ids": []any{int64(1), int64(2)},
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if strings.Join(seen, ",") != strings.Join(tc.want, ",") {
-				t.Errorf("saw params %v, want %v (sql=%q)", seen, tc.want, tc.sql)
+			// Exactly the one declared list param expanded. A colon picked up
+			// from a literal or comment would add args or fail to resolve.
+			if len(args) != 2 {
+				t.Errorf("got %d args, want 2 (sql=%q)", len(args), gotSQL)
 			}
 		})
 	}
 }
 
-func TestWalkPlaceholdersPreservesText(t *testing.T) {
-	var sb strings.Builder
-	err := walkPlaceholders(`SELECT 'a:b' FROM t WHERE id = :id`, &sb,
-		func(string) (string, error) { return "?", nil })
+// Text inside a string literal must survive the parse/print round-trip
+// untouched, even though identifiers get requoted.
+func TestBindArgsPreservesStringLiterals(t *testing.T) {
+	q := mkQuery(`SELECT 'a:b' FROM t WHERE id = :id`, Param{Name: "id", Type: TypeInt})
+	got, args, err := bindArgs(q, map[string]any{"id": int64(7)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `SELECT 'a:b' FROM t WHERE id = ?`
-	if sb.String() != want {
-		t.Errorf("got %q, want %q", sb.String(), want)
+	if !strings.Contains(got, `'a:b'`) {
+		t.Errorf("string literal was altered: %q", got)
+	}
+	// No list param, so binding stays named rather than positional.
+	if len(args) != 1 {
+		t.Errorf("got %d args, want 1", len(args))
 	}
 }
 

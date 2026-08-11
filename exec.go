@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	sqlparser "github.com/rqlite/sql"
 )
 
 // bindArgs resolves the declared parameters of q against the supplied values,
@@ -24,7 +27,7 @@ import (
 func bindArgs(q *Query, vals map[string]any) (string, []any, error) {
 	for name := range vals {
 		if _, ok := q.Param(name); !ok {
-			return "", nil, fmt.Errorf("unknown parameter %q for query %q", name, q.Name)
+			return "", nil, errUnknownParam(name, q.Name, q.paramNames())
 		}
 	}
 
@@ -38,7 +41,7 @@ func bindArgs(q *Query, vals map[string]any) (string, []any, error) {
 		case p.HasDeflt:
 			v = p.Default
 		case p.Required:
-			return "", nil, fmt.Errorf("missing required parameter %q", p.Name)
+			return "", nil, errMissingParam(p.Name)
 		default:
 			if p.Type.IsList() {
 				v = []any{}
@@ -49,7 +52,8 @@ func bindArgs(q *Query, vals map[string]any) (string, []any, error) {
 		if p.Type.IsList() {
 			hasList = true
 			if _, ok := v.([]any); !ok {
-				return "", nil, fmt.Errorf("parameter %q expects a list", p.Name)
+				return "", nil, badRequest(CodeInvalidType,
+					"parameter %q expects a list", p.Name).withParam(p.Name)
 			}
 		}
 		resolved[p.Name] = v
@@ -68,138 +72,141 @@ func bindArgs(q *Query, vals map[string]any) (string, []any, error) {
 
 // expandLists rewrites every `:name` reference in the SQL to positional
 // placeholders, expanding list parameters to one placeholder per element.
+//
+// The rewrite runs over the parsed AST rather than the SQL text: a *sql.BindExpr
+// node is a placeholder by construction, so a colon inside a string literal,
+// quoted identifier or comment can never be mistaken for one. Bind nodes are
+// visited in source order, which is the order SQLite assigns to `?`, so args is
+// built by appending as each node is replaced.
 func expandLists(q *Query, resolved map[string]any) (string, []any, error) {
-	var sb strings.Builder
-	var args []any
-
-	err := walkPlaceholders(q.SQL, &sb, func(name string) (string, error) {
-		p, ok := q.Param(name)
-		if !ok {
-			return "", fmt.Errorf("SQL references undeclared parameter %q", name)
-		}
-		v := resolved[name]
-
-		if !p.Type.IsList() {
-			args = append(args, v)
-			return "?", nil
-		}
-
-		items := v.([]any)
-		if len(items) == 0 {
-			// `IN ()` is a syntax error in SQLite, and an empty list should
-			// match nothing rather than everything. SELECT NULL yields a
-			// single NULL row, and `x IN (NULL)` is never true.
-			return "SELECT NULL WHERE 0", nil
-		}
-		ph := make([]string, len(items))
-		for i, item := range items {
-			ph[i] = "?"
-			args = append(args, item)
-		}
-		return strings.Join(ph, ", "), nil
-	})
+	stmt, err := parseSQL(q.SQL)
 	if err != nil {
 		return "", nil, err
 	}
-	return sb.String(), args, nil
+
+	v := &bindExpander{q: q, resolved: resolved}
+	out, err := sqlparser.Walk(v, stmt)
+	if err != nil {
+		return "", nil, err
+	}
+	if v.err != nil {
+		return "", nil, v.err
+	}
+	return out.String(), v.args, nil
 }
 
-// walkPlaceholders scans SQL for `:name` placeholders, writing the text to out
-// and substituting each placeholder with the result of replace. String
-// literals, quoted identifiers and comments are copied verbatim so a colon
-// inside them is never mistaken for a parameter.
-func walkPlaceholders(src string, out *strings.Builder, replace func(name string) (string, error)) error {
-	for i := 0; i < len(src); {
-		c := src[i]
+// parseSQL parses a single SQLite statement into its AST.
+func parseSQL(src string) (sqlparser.Statement, error) {
+	stmt, err := sqlparser.NewParser(strings.NewReader(src)).ParseStatement()
+	if err != nil {
+		return nil, fmt.Errorf("parsing SQL: %w", err)
+	}
+	return stmt, nil
+}
 
-		switch {
-		case c == '\'', c == '"', c == '`':
-			j := skipQuoted(src, i)
-			out.WriteString(src[i:j])
-			i = j
-			continue
+// bindExpander replaces each named bind with positional placeholders,
+// collecting the bind arguments in visit order.
+type bindExpander struct {
+	q        *Query
+	resolved map[string]any
+	args     []any
+	err      error
+}
 
-		case c == '-' && i+1 < len(src) && src[i+1] == '-':
-			j := i
-			for j < len(src) && src[j] != '\n' {
-				j++
-			}
-			out.WriteString(src[i:j])
-			i = j
-			continue
+func (v *bindExpander) Visit(n sqlparser.Node) (sqlparser.Visitor, sqlparser.Node, error) {
+	return v, n, nil
+}
 
-		case c == '/' && i+1 < len(src) && src[i+1] == '*':
-			j := i + 2
-			for j+1 < len(src) && !(src[j] == '*' && src[j+1] == '/') {
-				j++
-			}
-			if j+1 < len(src) {
-				j += 2
-			} else {
-				j = len(src)
-			}
-			out.WriteString(src[i:j])
-			i = j
-			continue
+func (v *bindExpander) VisitEnd(n sqlparser.Node) (sqlparser.Node, error) {
+	if v.err != nil {
+		return n, nil
+	}
 
-		case c == ':':
-			// `::` is a cast operator, not a placeholder.
-			if i+1 < len(src) && src[i+1] == ':' {
-				out.WriteString("::")
-				i += 2
-				continue
+	switch node := n.(type) {
+	case *sqlparser.ExprList:
+		// Walk is bottom-up, so a list bind among these elements has already
+		// become a nested ExprList. Both an `IN (...)` right-hand side and an
+		// expanded list print their own parentheses, so splice the nested
+		// elements into this list to keep exactly one pair.
+		return flattenExprList(node), nil
+
+	case *sqlparser.BindExpr:
+		p, val, ok := v.lookup(node)
+		if !ok {
+			return n, nil
+		}
+		if p.Type.IsList() {
+			exprs, empty := v.expandItems(p.Name, val)
+			if empty {
+				// `IN ()` is a syntax error in SQLite, and an empty list should
+				// match nothing rather than everything. NULL is never equal to
+				// anything, so `x IN (NULL)` is never true.
+				return &sqlparser.NullLit{}, nil
 			}
-			j := i + 1
-			for j < len(src) && isIdentByte(src[j], j == i+1) {
-				j++
+			if exprs == nil {
+				return n, nil
 			}
-			if j == i+1 {
-				out.WriteByte(c)
-				i++
-				continue
-			}
-			rep, err := replace(src[i+1 : j])
-			if err != nil {
-				return err
-			}
-			out.WriteString(rep)
-			i = j
+			return &sqlparser.ExprList{Exprs: exprs}, nil
+		}
+		v.args = append(v.args, val)
+		return positional(), nil
+	}
+	return n, nil
+}
+
+// flattenExprList splices any directly nested ExprList into its parent, so an
+// expanded list bind contributes its placeholders as siblings rather than as a
+// separately parenthesized group.
+func flattenExprList(list *sqlparser.ExprList) sqlparser.Node {
+	out := make([]sqlparser.Expr, 0, len(list.Exprs))
+	for _, e := range list.Exprs {
+		if inner, ok := e.(*sqlparser.ExprList); ok {
+			out = append(out, inner.Exprs...)
 			continue
 		}
-
-		out.WriteByte(c)
-		i++
+		out = append(out, e)
 	}
-	return nil
+	return &sqlparser.ExprList{Exprs: out}
 }
 
-// skipQuoted returns the index just past the quoted run beginning at i,
-// honoring doubled-quote escapes.
-func skipQuoted(src string, i int) int {
-	q := src[i]
-	j := i + 1
-	for j < len(src) {
-		if src[j] == q {
-			if j+1 < len(src) && src[j+1] == q {
-				j += 2
-				continue
-			}
-			return j + 1
-		}
-		j++
+// expandItems turns a resolved list value into one placeholder per element,
+// appending each element to args. empty reports a zero-length list; a nil
+// slice with empty false means the value was not a list and v.err is set.
+func (v *bindExpander) expandItems(name string, val any) (exprs []sqlparser.Expr, empty bool) {
+	items, ok := val.([]any)
+	if !ok {
+		v.err = badRequest(CodeInvalidType, "parameter %q expects a list", name).withParam(name)
+		return nil, false
 	}
-	return len(src)
+	if len(items) == 0 {
+		return nil, true
+	}
+	exprs = make([]sqlparser.Expr, len(items))
+	for i, item := range items {
+		exprs[i] = positional()
+		v.args = append(v.args, item)
+	}
+	return exprs, false
 }
 
-func isIdentByte(c byte, first bool) bool {
-	switch {
-	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
-		return true
-	case !first && c >= '0' && c <= '9':
-		return true
+// lookup resolves a bind node to its declared parameter and bound value.
+func (v *bindExpander) lookup(b *sqlparser.BindExpr) (Param, any, bool) {
+	// BindExpr.Name carries the leading marker, e.g. ":ids".
+	name := strings.TrimPrefix(b.Name, ":")
+	p, ok := v.q.Param(name)
+	if !ok {
+		// The query text references a parameter it never declared. That is an
+		// authoring bug in the .sql file, not bad client input, so it is a 500
+		// rather than a 400 -- nothing the caller sent could have avoided it.
+		v.err = newError(http.StatusInternalServerError, CodeQueryFailed,
+			"query %q references undeclared parameter %q", v.q.Name, name)
+		return Param{}, nil, false
 	}
-	return false
+	return p, v.resolved[name], true
 }
+
+// positional returns a fresh `?` placeholder node.
+func positional() *sqlparser.BindExpr { return &sqlparser.BindExpr{Name: "?"} }
 
 // streamResult reports what happened during a streamed query. It is only
 // complete once streamQuery returns.

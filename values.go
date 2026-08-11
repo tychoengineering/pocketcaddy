@@ -33,28 +33,6 @@ func coerce(raw string, t ParamType) (any, error) {
 	}
 }
 
-// coerceDefault parses an @param default value. List defaults are written
-// comma-separated, e.g. `-- @param ids int[] = 1,2,3`; an empty string yields
-// an empty list.
-func coerceDefault(raw string, t ParamType) (any, error) {
-	if !t.IsList() {
-		return coerce(raw, t)
-	}
-	raw = strings.TrimSuffix(strings.TrimPrefix(raw, "("), ")")
-	if raw == "" {
-		return []any{}, nil
-	}
-	out := []any{}
-	for _, item := range strings.Split(raw, ",") {
-		v, err := coerce(strings.TrimSpace(item), t.Elem())
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, v)
-	}
-	return out, nil
-}
-
 // coerceList converts a slice of raw strings (repeated query params) into the
 // declared element type.
 func coerceList(raws []string, t ParamType) (any, error) {
@@ -151,13 +129,13 @@ func coerceJSON(v any, t ParamType) (any, error) {
 
 // operators maps PostgREST operator tokens to SQL comparison operators.
 var operators = map[string]string{
-	"eq":   "=",
-	"neq":  "<>",
-	"gt":   ">",
-	"gte":  ">=",
-	"lt":   "<",
-	"lte":  "<=",
-	"like": "LIKE",
+	"eq":    "=",
+	"neq":   "<>",
+	"gt":    ">",
+	"gte":   ">=",
+	"lt":    "<",
+	"lte":   "<=",
+	"like":  "LIKE",
 	"ilike": "LIKE", // SQLite LIKE is case-insensitive for ASCII by default
 }
 
@@ -195,10 +173,15 @@ type orderTerm struct {
 func parseFilter(column, spec string, q *Query) (filter, error) {
 	f := filter{Column: column}
 	if err := checkColumn(column, q); err != nil {
+		// In a filter the query-string key is the column itself.
+		if e, ok := err.(*Error); ok {
+			return f, e.withParam(column)
+		}
 		return f, err
 	}
 
-	op, val, ok := strings.Cut(spec, ".")
+	sc := &filterScanner{src: spec}
+	op, ok := sc.nextSegment()
 	if !ok {
 		// Bare `column=value` is shorthand for eq.
 		f.Op = "="
@@ -208,11 +191,13 @@ func parseFilter(column, spec string, q *Query) (filter, error) {
 
 	if op == "not" {
 		f.Negate = true
-		op, val, ok = strings.Cut(val, ".")
+		op, ok = sc.nextSegment()
 		if !ok {
-			return f, fmt.Errorf("filter %q: expected not.<op>.<value>", spec)
+			return f, badRequest(CodeInvalidFilter,
+				"filter %q: expected not.<op>.<value>", spec).withParam(column)
 		}
 	}
+	val := sc.rest()
 
 	switch op {
 	case "is":
@@ -227,13 +212,14 @@ func parseFilter(column, spec string, q *Query) (filter, error) {
 			f.Op, f.Value = "=", false
 			return f, nil
 		}
-		return f, fmt.Errorf("filter %q: is.<null|true|false> only", spec)
+		return f, badRequest(CodeInvalidFilter,
+			"filter %q: is accepts null, true or false only", spec).withParam(column)
 	case "in":
-		list := strings.TrimSuffix(strings.TrimPrefix(val, "("), ")")
-		if list == "" {
-			return f, fmt.Errorf("filter %q: in.() requires values", spec)
+		items, err := parseList(val)
+		if err != nil {
+			return f, badRequest(CodeInvalidFilter, "filter %q: %v", spec, err).withParam(column)
 		}
-		for _, item := range splitCSV(list) {
+		for _, item := range items {
 			f.InList = append(f.InList, item)
 		}
 		f.Op = "IN"
@@ -242,32 +228,11 @@ func parseFilter(column, spec string, q *Query) (filter, error) {
 
 	sqlOp, known := operators[op]
 	if !known {
-		return f, fmt.Errorf("unknown operator %q in filter for %q", op, column)
+		return f, errUnknownOperator(op, column)
 	}
 	f.Op = sqlOp
 	f.Value = val
 	return f, nil
-}
-
-// splitCSV splits a PostgREST in-list, honoring double-quoted items.
-func splitCSV(s string) []string {
-	var out []string
-	var cur strings.Builder
-	inQuote := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c == '"':
-			inQuote = !inQuote
-		case c == ',' && !inQuote:
-			out = append(out, cur.String())
-			cur.Reset()
-		default:
-			cur.WriteByte(c)
-		}
-	}
-	out = append(out, cur.String())
-	return out
 }
 
 // checkColumn verifies that a client-supplied identifier is well-formed and
@@ -276,10 +241,10 @@ func splitCSV(s string) []string {
 // turns a typo into a 400 rather than a silently empty result.
 func checkColumn(name string, q *Query) error {
 	if !validIdent(name) {
-		return fmt.Errorf("invalid column name %q", name)
+		return errInvalidColumn(name)
 	}
 	if q != nil && len(q.Columns) > 0 && !q.HasColumn(name) {
-		return fmt.Errorf("query %q has no column %q", q.Name, name)
+		return errUnknownColumn(name, q.Name, q.columnNames())
 	}
 	return nil
 }
@@ -295,6 +260,10 @@ func parseOrder(spec string, q *Query) ([]orderTerm, error) {
 		bits := strings.Split(part, ".")
 		t := orderTerm{Column: bits[0]}
 		if err := checkColumn(t.Column, q); err != nil {
+			// The client sent `order=`; the column is only part of its value.
+			if e, ok := err.(*Error); ok {
+				return nil, e.withParam("order")
+			}
 			return nil, err
 		}
 		for _, mod := range bits[1:] {
@@ -308,7 +277,12 @@ func parseOrder(spec string, q *Query) ([]orderTerm, error) {
 			case "nullslast":
 				t.Nulls = "last"
 			default:
-				return nil, fmt.Errorf("unknown order modifier %q", mod)
+				e := badRequest(CodeInvalidOrder, "unknown order modifier %q", mod).
+					withParam("order")
+				e.Meta = map[string]any{
+					"modifiers": []string{"asc", "desc", "nullsfirst", "nullslast"},
+				}
+				return nil, e
 			}
 		}
 		terms = append(terms, t)
@@ -327,21 +301,30 @@ func parseSelect(spec string, q *Query) ([]string, error) {
 		alias, col, renamed := strings.Cut(part, ":")
 		if renamed {
 			if !validIdent(alias) {
-				return nil, fmt.Errorf("invalid select alias %q", alias)
+				return nil, badRequest(CodeInvalidSelect,
+					"invalid select alias %q", alias).withParam("select")
 			}
 			if err := checkColumn(col, q); err != nil {
+				if e, ok := err.(*Error); ok {
+					return nil, e.withParam("select")
+				}
 				return nil, err
 			}
 			cols = append(cols, quoteIdent(col)+" AS "+quoteIdent(alias))
 			continue
 		}
 		if err := checkColumn(part, q); err != nil {
+			// The client sent `select=`; the column is part of its value.
+			if e, ok := err.(*Error); ok {
+				return nil, e.withParam("select")
+			}
 			return nil, err
 		}
 		cols = append(cols, quoteIdent(part))
 	}
 	if len(cols) == 0 {
-		return nil, fmt.Errorf("select requires at least one column")
+		return nil, badRequest(CodeInvalidSelect,
+			"select requires at least one column").withParam("select")
 	}
 	return cols, nil
 }

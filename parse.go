@@ -97,6 +97,28 @@ func (q *Query) Param(name string) (Param, bool) {
 	return p, ok
 }
 
+// paramNames lists the declared parameters in declaration order, used as the
+// hint on an unknown-parameter error.
+func (q *Query) paramNames() []string {
+	out := make([]string, 0, len(q.Params))
+	for _, p := range q.Params {
+		out = append(out, p.Name)
+	}
+	return out
+}
+
+// columnNames lists the query's output columns, used as the hint on an
+// unknown-column error. Columns is a set, so the result is sorted for a stable
+// response.
+func (q *Query) columnNames() []string {
+	out := make([]string, 0, len(q.Columns))
+	for c := range q.Columns {
+		out = append(out, c)
+	}
+	sortStrings(out)
+	return out
+}
+
 // parseSQLFile parses the contents of a .sql file into a Query. The query name
 // defaults to defaultName (the file's base name) unless overridden by @name.
 //
@@ -165,7 +187,8 @@ func parseSQLFile(defaultName, src string) (*Query, error) {
 }
 
 // splitDirective reports whether line is a `-- @directive rest` comment and,
-// if so, returns the directive token and the remainder.
+// if so, returns the directive token and the remainder. The remainder is
+// returned raw; each directive decides whether to tokenize it.
 func splitDirective(line string) (directive, rest string, ok bool) {
 	t := strings.TrimSpace(line)
 	if !strings.HasPrefix(t, "--") {
@@ -175,59 +198,156 @@ func splitDirective(line string) (directive, rest string, ok bool) {
 	if !strings.HasPrefix(t, "@") {
 		return "", "", false
 	}
-	directive, rest, _ = strings.Cut(t, " ")
-	return directive, strings.TrimSpace(rest), true
+
+	// The directive name runs to the first space; the rest is its body.
+	lx := newLexer(t)
+	tok, err := lx.next()
+	if err != nil || tok.Kind != tokWord {
+		return "", "", false
+	}
+	return tok.Text, lx.rest(), true
 }
 
-// parseParam parses the body of an @param directive:
+// parseParam parses the body of an @param directive as a token stream:
 //
 //	name [type] [required | = default] [description...]
+//
+// Everything after the type/default clause is a free-form description, so it is
+// taken from the lexer's unconsumed remainder rather than being tokenized.
 func parseParam(s string) (Param, error) {
-	fields := strings.Fields(s)
-	if len(fields) == 0 {
+	lx := newLexer(s)
+
+	nameTok, err := lx.next()
+	if err != nil {
+		return Param{}, err
+	}
+	if nameTok.Kind == tokEOF {
 		return Param{}, fmt.Errorf("@param requires a name")
 	}
-
-	p := Param{Name: fields[0], Type: TypeText}
-	if !validIdent(p.Name) {
-		return Param{}, fmt.Errorf("invalid @param name %q", p.Name)
+	if nameTok.Kind != tokWord || !validIdent(nameTok.Text) {
+		return Param{}, fmt.Errorf("column %d: invalid @param name %q", nameTok.Col, nameTok.Text)
 	}
-	rest := fields[1:]
+	p := Param{Name: nameTok.Text, Type: TypeText}
 
-	if len(rest) > 0 {
-		if t, ok := parseType(rest[0]); ok {
+	// Optional type.
+	tok, err := lx.peek()
+	if err != nil {
+		return Param{}, err
+	}
+	if tok.Kind == tokWord {
+		if t, ok := parseType(tok.Text); ok {
 			p.Type = t
-			rest = rest[1:]
+			if _, err := lx.next(); err != nil {
+				return Param{}, err
+			}
 		}
 	}
 
-	if len(rest) > 0 {
-		switch {
-		case rest[0] == "required":
-			p.Required = true
-			rest = rest[1:]
-		case rest[0] == "=":
-			if len(rest) < 2 {
-				return Param{}, fmt.Errorf("@param %s: '=' requires a default value", p.Name)
-			}
-			v, err := coerceDefault(rest[1], p.Type)
-			if err != nil {
-				return Param{}, fmt.Errorf("@param %s default: %w", p.Name, err)
-			}
-			p.Default, p.HasDeflt = v, true
-			rest = rest[2:]
-		case strings.HasPrefix(rest[0], "="):
-			v, err := coerceDefault(strings.TrimPrefix(rest[0], "="), p.Type)
-			if err != nil {
-				return Param{}, fmt.Errorf("@param %s default: %w", p.Name, err)
-			}
-			p.Default, p.HasDeflt = v, true
-			rest = rest[1:]
+	// Optional `required` or `= default`.
+	tok, err = lx.peek()
+	if err != nil {
+		return Param{}, err
+	}
+	switch {
+	case tok.Kind == tokWord && tok.Text == "required":
+		if _, err := lx.next(); err != nil {
+			return Param{}, err
 		}
+		p.Required = true
+
+	case tok.Kind == tokEq:
+		if _, err := lx.next(); err != nil {
+			return Param{}, err
+		}
+		v, err := parseDefault(lx, p.Type)
+		if err != nil {
+			return Param{}, fmt.Errorf("@param %s default: %w", p.Name, err)
+		}
+		p.Default, p.HasDeflt = v, true
 	}
 
-	p.Desc = strings.Join(rest, " ")
+	p.Desc = lx.rest()
 	return p, nil
+}
+
+// parseDefault parses the value after `=` in an @param declaration. A list
+// default is a comma-separated sequence, optionally parenthesized:
+//
+//	-- @param ids int[] = 1,2,3
+//	-- @param ids int[] = (1, 2, 3)
+//	-- @param tags text[] = "a,b",c
+func parseDefault(lx *lexer, t ParamType) (any, error) {
+	if !t.IsList() {
+		tok, err := lx.next()
+		if err != nil {
+			return nil, err
+		}
+		if tok.Kind == tokEOF {
+			return nil, fmt.Errorf("'=' requires a default value")
+		}
+		if tok.Kind != tokWord && tok.Kind != tokString {
+			return nil, fmt.Errorf("column %d: unexpected %s", tok.Col, tok.Kind)
+		}
+		return coerce(tok.Text, t)
+	}
+
+	// Optional surrounding parentheses.
+	paren := false
+	if tok, err := lx.peek(); err != nil {
+		return nil, err
+	} else if tok.Kind == tokLParen {
+		paren = true
+		if _, err := lx.next(); err != nil {
+			return nil, err
+		}
+	}
+
+	out := []any{}
+	for {
+		tok, err := lx.peek()
+		if err != nil {
+			return nil, err
+		}
+		// An empty list, or the end of an unparenthesized one.
+		if tok.Kind == tokEOF || (paren && tok.Kind == tokRParen) {
+			break
+		}
+		if tok.Kind != tokWord && tok.Kind != tokString {
+			// Not part of the list: unparenthesized defaults end where the
+			// description begins.
+			break
+		}
+		if _, err := lx.next(); err != nil {
+			return nil, err
+		}
+		v, err := coerce(tok.Text, t.Elem())
+		if err != nil {
+			return nil, fmt.Errorf("column %d: %w", tok.Col, err)
+		}
+		out = append(out, v)
+
+		sep, err := lx.peek()
+		if err != nil {
+			return nil, err
+		}
+		if sep.Kind != tokComma {
+			break
+		}
+		if _, err := lx.next(); err != nil {
+			return nil, err
+		}
+	}
+
+	if paren {
+		tok, err := lx.next()
+		if err != nil {
+			return nil, err
+		}
+		if tok.Kind != tokRParen {
+			return nil, fmt.Errorf("column %d: expected ')' to close the default list", tok.Col)
+		}
+	}
+	return out, nil
 }
 
 func parseType(s string) (ParamType, bool) {

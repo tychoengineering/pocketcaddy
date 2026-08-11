@@ -26,13 +26,14 @@ arch=$(uname -m)
 case "$os-$arch" in
 Darwin-arm64) target="darwin_arm64" ;;
 Linux-x86_64) target="linux_amd64" ;;
+Linux-aarch64 | Linux-arm64) target="linux_arm64" ;;
 Darwin-x86_64)
 	die "macOS on Intel is not a published target.
 Build from source instead: go install github.com/$REPO/cmd/$BIN@latest"
 	;;
 *)
 	die "unsupported platform $os/$arch.
-Published targets are macOS arm64 and Linux amd64.
+Published targets are macOS arm64, Linux amd64, and Linux arm64.
 Build from source instead: go install github.com/$REPO/cmd/$BIN@latest"
 	;;
 esac

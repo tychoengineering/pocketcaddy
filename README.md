@@ -83,6 +83,8 @@ go test ./...
 go build ./cmd/pocketcaddy
 ```
 
+[RELEASE.md](RELEASE.md) covers cutting a release.
+
 ## Layout
 
 ```

@@ -40,13 +40,17 @@ esac
 need curl
 need tar
 
-# Resolve the version, defaulting to whatever /releases/latest redirects to.
+# Resolve the version from the releases API. A HEAD request against
+# /releases/latest answers 404 even when the release exists, so ask the API
+# with a GET rather than following a redirect.
 version="${POCKETCADDY_VERSION:-}"
 if [ -z "$version" ]; then
-	version=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-		"https://github.com/$REPO/releases/latest" |
-		sed 's#.*/tag/##')
-	[ -n "$version" ] || die "could not determine the latest version"
+	version=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null |
+		sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+		head -1)
+	[ -n "$version" ] || die "could not determine the latest version.
+The API returned no release for $REPO. If the repository is private,
+download the archive manually or set POCKETCADDY_VERSION."
 fi
 # Accept both "v0.1.0" and "0.1.0"; archive names carry no leading v.
 num_version="${version#v}"

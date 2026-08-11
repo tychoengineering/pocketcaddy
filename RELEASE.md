@@ -1,8 +1,8 @@
 # Releasing
 
-A release publishes two archives, a checksum file, and a Homebrew cask. Pushing
-a `v*` tag is the whole procedure; everything else here explains what that tag
-sets in motion and how to check the result.
+A release publishes three archives, a checksum file, and a Homebrew cask.
+Pushing a `v*` tag is the whole procedure; everything else here explains what
+that tag sets in motion and how to check the result.
 
 ## Cutting a release
 
@@ -23,7 +23,7 @@ Watch the run, which takes about eight minutes:
 gh run watch --exit-status
 ```
 
-Then confirm the release carries both archives and the checksums:
+Then confirm the release carries every archive and the checksums:
 
 ```sh
 gh release view v0.2.0
@@ -40,11 +40,12 @@ the tag the binary was built from.
 failing test stops the release before it publishes anything, which is the only
 gate on a tag — no workflow runs on pushes to `main` or on pull requests.
 
-GoReleaser reads `.goreleaser.yaml` and, for macOS arm64 and Linux amd64:
+GoReleaser reads `.goreleaser.yaml` and, for macOS arm64, Linux amd64, and
+Linux arm64:
 
 1. Builds `./cmd/pocketcaddy` with `CGO_ENABLED=0`, `-trimpath`, and `-s -w`.
 2. Archives the binary with `README.md` and `LICENSE`.
-3. Writes `checksums.txt` over both archives.
+3. Writes `checksums.txt` over all three archives.
 4. Creates the GitHub release.
 5. Pushes `Casks/pocketcaddy.rb` to `tychoengineering/homebrew-tap`.
 
@@ -55,12 +56,13 @@ version string like `pocketcaddy 0.2.0 (caddy 2.11.4)` makes the linker treat
 
 ## Targets
 
-Releases cover macOS arm64 and Linux amd64. `.goreleaser.yaml` ignores the
-other two combinations its `goos`/`goarch` lists imply.
+Releases cover macOS arm64, Linux amd64, and Linux arm64. `.goreleaser.yaml`
+ignores macOS amd64, the fourth combination its `goos` and `goarch` lists
+imply.
 
-Adding a target means deleting its `ignore` entry, and — for macOS amd64 —
-removing the matching case from `install.sh`, which names that platform
-explicitly so an Intel Mac gets a useful message rather than a 404.
+Adding macOS amd64 means deleting its `ignore` entry and removing the matching
+case from `install.sh`, which names that platform explicitly so an Intel Mac
+gets a useful message rather than a 404.
 
 Cross-compiling needs no C toolchain. `modernc.org/sqlite` is pure Go, which is
 what keeps `CGO_ENABLED=0` viable; a dependency that needs cgo would break both

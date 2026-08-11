@@ -36,9 +36,10 @@ Or with Homebrew:
 brew install tychoengineering/tap/pocketcaddy
 ```
 
-Both cover macOS arm64 and Linux amd64. The script picks the matching build,
-checks it against the release checksums, and installs to `/usr/local/bin`. Set
-`INSTALL_DIR` to install elsewhere and `POCKETCADDY_VERSION` to pin a release.
+Both cover macOS arm64, Linux amd64, and Linux arm64. The script picks the
+matching build, checks it against the release checksums, and installs to
+`/usr/local/bin`. Set `INSTALL_DIR` to install elsewhere and
+`POCKETCADDY_VERSION` to pin a release.
 
 ### Running it
 

@@ -4,9 +4,12 @@
 
 <h1 align="center">PocketCaddy</h1>
 
-A Caddy HTTP handler that serves named, read-only SQL queries over SQLite
-databases. Drop `.sqlite` files in a folder, write `.sql` files with a few
-comment directives, and each one becomes an HTTP endpoint that streams JSONL.
+A web server that turns SQLite databases into read-only JSON APIs. Drop
+`.sqlite` files in a folder, write `.sql` files with a few comment directives,
+and each one becomes an HTTP endpoint that streams JSONL.
+
+Ships as a single binary with no dependencies, and as a
+[Caddy](https://caddyserver.com) handler you can add to an existing build.
 
 - **Read-only.** The module opens each database `mode=ro` with `query_only(1)`.
   A query that attempts a write fails at startup, not at request time.
@@ -15,51 +18,69 @@ comment directives, and each one becomes an HTTP endpoint that streams JSONL.
   memory.
 - **No SQL injection surface.** The module binds every value. It checks each
   identifier against the query's output columns, then quotes it.
-- **Pure Go.** Uses `modernc.org/sqlite`, so `xcaddy` builds need no cgo.
+- **Pure Go.** Uses `modernc.org/sqlite`, so the binary is static and builds
+  need no cgo.
 
 ## Installing
 
-The `pocketcaddy` binary is Caddy with this handler compiled in, so it takes
-every Caddy command and Caddyfile directive. Releases cover macOS arm64 and
-Linux amd64.
+Install the `pocketcaddy` binary. It needs no runtime, no Go toolchain, and no
+separate Caddy — the server is compiled in.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tychoengineering/pocketcaddy/main/install.sh | sh
 ```
 
-The script picks the right build, checks it against the release checksums, and
-installs to `/usr/local/bin`. Set `INSTALL_DIR` to put it elsewhere and
-`POCKETCADDY_VERSION` to pin a release.
-
-With Homebrew:
+Or with Homebrew:
 
 ```sh
 brew install tychoengineering/tap/pocketcaddy
 ```
 
-With Go, which builds from source and works on any platform:
+Both cover macOS arm64 and Linux amd64. The script picks the matching build,
+checks it against the release checksums, and installs to `/usr/local/bin`. Set
+`INSTALL_DIR` to install elsewhere and `POCKETCADDY_VERSION` to pin a release.
 
-```sh
-go install github.com/tychoengineering/pocketcaddy/cmd/pocketcaddy@latest
-```
+### Running it
 
-Then run a Caddyfile:
+Point a Caddyfile at a directory of databases and queries, then run it:
 
 ```sh
 pocketcaddy run --config Caddyfile
 ```
 
-The macOS binary is unsigned. Both the install script and Homebrew clear the
-quarantine attribute, but an archive downloaded through a browser will not
-open until you clear it yourself with
-`xattr -dr com.apple.quarantine pocketcaddy`.
+The binary is Caddy with this handler registered, so every Caddy command works
+— `run`, `start`, `stop`, `reload`, `validate`, `fmt` — and a Caddyfile may mix
+`pocketcaddy` with any other directive. [Caddyfile](#caddyfile) covers the
+configuration, and [Writing a query](#writing-a-query) covers the `.sql` files.
 
-## Building
+The macOS binary is unsigned. The install script and Homebrew both clear the
+quarantine attribute, so Gatekeeper stops only an archive you downloaded
+through a browser. Clear it with `xattr -dr com.apple.quarantine pocketcaddy`.
 
-To add this handler to an existing Caddy build instead:
+## Building from source
+
+Building needs Go 1.25.5 or later. The build is pure Go, so it needs no C
+toolchain and runs with `CGO_ENABLED=0`.
+
+Install the binary from source, on any platform Go targets:
+
+```sh
+go install github.com/tychoengineering/pocketcaddy/cmd/pocketcaddy@latest
+```
+
+Add the handler to an existing Caddy build instead, alongside other plugins:
 
 ```sh
 xcaddy build --with github.com/tychoengineering/pocketcaddy
+```
+
+Or work on the module itself:
+
+```sh
+git clone https://github.com/tychoengineering/pocketcaddy
+cd pocketcaddy
+go test ./...
+go build ./cmd/pocketcaddy
 ```
 
 ## Layout
